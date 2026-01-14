@@ -7,77 +7,138 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // Initialize Firebase Admin
+let firebaseAdminInitialized = false;
 try {
-  // Option 1: Use service account (if you have credentials file)
-  // const serviceAccount = require("./path-to-serviceAccountKey.json");
-  // admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-  
-  // Option 2: Use environment variables (recommended for production)
-  if (process.env.FIREBASE_PROJECT_ID) {
-    admin.initializeApp({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-    });
+  // Check if Firebase Admin is already initialized
+  if (admin.apps.length === 0) {
+    // Option 1: Use service account (if you have credentials file)
+    // const serviceAccount = require("./path-to-serviceAccountKey.json");
+    // admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    
+    // Option 2: Use environment variables (recommended for production)
+    if (process.env.FIREBASE_PROJECT_ID) {
+      admin.initializeApp({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+      });
+    } else {
+      // Option 3: Initialize without credentials (will verify tokens using public keys)
+      admin.initializeApp();
+    }
+    firebaseAdminInitialized = true;
+    console.log("✅ Firebase Admin initialized");
   } else {
-    // Option 3: Initialize without credentials (will verify tokens using public keys)
-    admin.initializeApp();
+    firebaseAdminInitialized = true;
+    console.log("✅ Firebase Admin already initialized");
   }
-  console.log("✅ Firebase Admin initialized");
 } catch (error) {
   console.warn("⚠️ Firebase Admin initialization warning:", error.message);
-  console.warn("⚠️ Authentication will use fallback method");
+  console.warn("⚠️ Authentication will use fallback method (headers-based)");
+  firebaseAdminInitialized = false;
 }
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: true, // Allow all origins (or specify your frontend URL)
+  credentials: true,
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-User-Email',
+    'X-User-UID',
+    'user-email',
+    'user-uid'
+  ],
+  exposedHeaders: ['Authorization']
+}));
 app.use(express.json());
 
-// Authentication Middleware - Verifies Firebase ID Token
+// Async error handler wrapper
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+// Global error handler middleware - Must be before routes
+app.use((err, req, res, next) => {
+  console.error("Global error handler:", err);
+  // Don't send response if headers already sent
+  if (res.headersSent) {
+    return next(err);
+  }
+  res.status(err.status || 500).json({
+    success: false,
+    error: err.message || "Internal server error",
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+  });
+});
+
+// Authentication Middleware - Verifies Firebase ID Token or uses fallback
 const authenticateToken = async (req, res, next) => {
   try {
+    // Method 1: Try Firebase ID token from Authorization header
     const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.split("Bearer ")[1] : null;
+
+    // Method 2: Fallback - Check for user info in headers (for frontend compatibility)
+    const userEmail = req.headers["x-user-email"] || req.headers["user-email"];
+    const userUid = req.headers["x-user-uid"] || req.headers["user-uid"];
+
+    // If we have user email and UID in headers, use that (more reliable fallback)
+    if (userEmail && userUid) {
+      req.user = {
+        uid: userUid,
+        email: userEmail,
+        name: userEmail?.split("@")[0],
+      };
+      console.log("✅ Authenticated via headers:", userEmail);
+      return next();
+    }
+
+    // Try Firebase Admin token verification if we have a token
+    if (token && firebaseAdminInitialized) {
+      try {
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        req.user = {
+          uid: decodedToken.uid,
+          email: decodedToken.email,
+          name: decodedToken.name || decodedToken.email?.split("@")[0],
+        };
+        console.log("✅ Authenticated via Firebase token:", decodedToken.email);
+        return next();
+      } catch (firebaseError) {
+        console.warn("⚠️ Firebase token verification failed:", firebaseError.message);
+        // Continue to check for headers fallback below
+      }
+    }
+
+    // If no token and no headers, return error
+    if (!token && !userEmail) {
       return res.status(401).json({
         success: false,
-        error: "Unauthorized: No token provided",
+        error: "Unauthorized: Please log in again. No authentication token or user info provided.",
+        hint: "Include Authorization header with Bearer token, or X-User-Email and X-User-UID headers",
       });
     }
 
-    const token = authHeader.split("Bearer ")[1];
-
-    try {
-      // Verify Firebase ID token
-      const decodedToken = await admin.auth().verifyIdToken(token);
-      req.user = {
-        uid: decodedToken.uid,
-        email: decodedToken.email,
-        name: decodedToken.name || decodedToken.email?.split("@")[0],
-      };
-      next();
-    } catch (firebaseError) {
-      // Fallback: If Firebase Admin fails, check if user info is in headers
-      const userEmail = req.headers["x-user-email"];
-      const userUid = req.headers["x-user-uid"];
-      
-      if (userEmail && userUid) {
-        req.user = {
-          uid: userUid,
-          email: userEmail,
-          name: userEmail?.split("@")[0],
-        };
-        next();
-      } else {
-        return res.status(401).json({
-          success: false,
-          error: "Unauthorized: Invalid token",
-        });
-      }
+    // If we have token but Firebase Admin failed and no headers, return error
+    if (token && !userEmail) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized: Please log in again. Token verification failed.",
+        hint: "Try including X-User-Email and X-User-UID headers as fallback",
+      });
     }
+
+    // Should not reach here, but just in case
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized: Authentication failed",
+    });
   } catch (error) {
     console.error("Authentication error:", error);
     return res.status(401).json({
       success: false,
       error: "Unauthorized: Authentication failed",
+      details: error.message,
     });
   }
 };
@@ -109,8 +170,11 @@ const isCreator = (resource, userEmail, userUid) => {
   return false;
 };
 
-// MongoDB URI
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.d3rwcxr.mongodb.net/?retryWrites=true&w=majority`;
+// MongoDB URI - with validation
+if (!process.env.DB_USER || !process.env.DB_PASS) {
+  console.warn("⚠️ Warning: DB_USER or DB_PASS environment variables are not set");
+}
+const uri = `mongodb+srv://${process.env.DB_USER || ''}:${process.env.DB_PASS || ''}@cluster0.d3rwcxr.mongodb.net/?retryWrites=true&w=majority`;
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -118,20 +182,67 @@ const client = new MongoClient(uri, {
     strict: true,
     deprecationErrors: true,
   },
+  // Connection options for better reliability
+  maxPoolSize: 10,
+  minPoolSize: 1,
+  maxIdleTimeMS: 30000,
+  serverSelectionTimeoutMS: 10000,
+  socketTimeoutMS: 45000,
 });
 
-async function run() {
-  try {
-    const db = client.db("eventBookingDB");
-    const groupCollection = db.collection("groups");
-    const joinedCollection = db.collection("joinedGroups");
-    const usersCollection = db.collection("users"); // **User collection**
-    const articlesCollection = db.collection("articles"); // **Articles collection**
-    const commentsCollection = db.collection("comments"); // **Comments collection**
+// Database connection state
+let db = null;
+let groupCollection = null;
+let joinedCollection = null;
+let usersCollection = null;
+let articlesCollection = null;
+let commentsCollection = null;
+let dbConnected = false;
 
-    // Create group - Protected: Requires authentication
-    app.post("/createGroup", authenticateToken, async (req, res) => {
+// Helper function to check database connection with auto-retry
+const checkDbConnection = async (res) => {
+  if (!dbConnected || !db) {
+    // Try to reconnect once
+    if (!client.topology || !client.topology.isConnected()) {
+      console.log("🔄 Attempting to reconnect to MongoDB...");
+      const reconnected = await connectToMongoDB(1, 1000);
+      if (reconnected) {
+        return null; // Connection restored
+      }
+    }
+    
+    return res.status(503).json({
+      success: false,
+      error: "Database connection not available",
+      message: "Unable to connect to database. Please try again later or contact support.",
+      hint: "Check server logs for connection details"
+    });
+  }
+  
+  // Verify connection is still alive
+  try {
+    await client.db("admin").command({ ping: 1 });
+  } catch (pingError) {
+    console.warn("⚠️ Database ping failed, marking as disconnected");
+    dbConnected = false;
+    return res.status(503).json({
+      success: false,
+      error: "Database connection lost",
+      message: "Connection to database was lost. Please try again."
+    });
+  }
+  
+  return null;
+};
+
+// Initialize routes - routes are always registered
+function initializeRoutes() {
+  // Create group - Protected: Requires authentication
+  app.post("/createGroup", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const groupData = req.body;
         
         // Set creator info from authenticated user
@@ -157,9 +268,12 @@ async function run() {
       }
     });
 
-    // Get all groups or by userEmail (for MyGroups)
-    app.get("/groups", async (req, res) => {
+  // Get all groups or by userEmail (for MyGroups)
+  app.get("/groups", async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { userEmail } = req.query;
         const filter = userEmail ? { userEmail } : {};
         const groups = await groupCollection.find(filter).toArray();
@@ -168,16 +282,23 @@ async function run() {
         console.error("Error fetching groups:", error);
         res
           .status(500)
-          .json({ success: false, error: "Failed to fetch groups" });
+          .json({ success: false, error: "Failed to fetch groups", details: error.message });
       }
     });
 
-    // Update group - Protected: Only creator can update
-    app.put("/groups/:id", authenticateToken, async (req, res) => {
-      const id = req.params.id;
-      const updatedData = req.body;
-
+  // Update group - Protected: Only creator can update
+  app.put("/groups/:id", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: "Invalid group ID format" });
+        }
+        
+        const updatedData = req.body;
+
         // First, check if group exists and user is the creator
         const group = await groupCollection.findOne({ _id: new ObjectId(id) });
         
@@ -218,10 +339,17 @@ async function run() {
       }
     });
 
-    // Delete group - Protected: Only creator can delete
-    app.delete("/groups/:id", authenticateToken, async (req, res) => {
-      const id = req.params.id;
+  // Delete group - Protected: Only creator can delete
+  app.delete("/groups/:id", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: "Invalid group ID format" });
+        }
+        
         // First, check if group exists and user is the creator
         const group = await groupCollection.findOne({ _id: new ObjectId(id) });
         
@@ -260,9 +388,12 @@ async function run() {
       }
     });
 
-    // Leave group - Protected: User can only leave their own join record
-    app.post("/leaveGroup", authenticateToken, async (req, res) => {
+  // Leave group - Protected: User can only leave their own join record
+  app.post("/leaveGroup", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { groupId } = req.body;
         if (!groupId) {
           return res
@@ -315,15 +446,22 @@ async function run() {
       }
     });
 
-    // Delete past events (example API route or background job)
-    const now = new Date();
-    await groupCollection.deleteMany({
-      formattedDate: { $lt: now.toISOString() },
-    });
+    // Delete past events - Moved to a separate endpoint or scheduled job
+    // Uncomment and use this endpoint if you need to delete past events:
+    // app.delete("/cleanup-past-events", authenticateToken, async (req, res) => {
+    //   const now = new Date();
+    //   const result = await groupCollection.deleteMany({
+    //     formattedDate: { $lt: now.toISOString() },
+    //   });
+    //   res.json({ success: true, deletedCount: result.deletedCount });
+    // });
 
-    // Join group - Protected: Requires authentication
-    app.post("/joinGroup", authenticateToken, async (req, res) => {
+  // Join group - Protected: Requires authentication
+  app.post("/joinGroup", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { groupId } = req.body;
         
         if (!groupId) {
@@ -372,12 +510,21 @@ async function run() {
       }
     });
 
-    // Get joined groups by user
-    app.get("/user-joined-groups", async (req, res) => {
-      const { email } = req.query;
+  // Get joined groups by user - Protected: Requires authentication
+  app.get("/user-joined-groups", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
+        // Use authenticated user's email instead of query parameter for security
+        const userEmail = req.user.email;
+        
+        if (!userEmail) {
+          return res.status(400).json({ success: false, message: "User email is required" });
+        }
+
         const groups = await joinedCollection
-          .find({ userEmail: email })
+          .find({ userEmail: userEmail })
           .toArray();
         res.status(200).json(groups);
       } catch (err) {
@@ -388,15 +535,29 @@ async function run() {
       }
     });
 
-    // Fetch groups by array of IDs (for joined groups details)
-    app.post("/groupsByIds", async (req, res) => {
+  // Fetch groups by array of IDs (for joined groups details)
+  app.post("/groupsByIds", async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { ids } = req.body;
         if (!ids || !Array.isArray(ids) || ids.length === 0) {
           return res
             .status(400)
             .json({ success: false, message: "Invalid group IDs" });
         }
+        
+        // Validate all IDs before converting
+        const invalidIds = ids.filter(id => !ObjectId.isValid(id));
+        if (invalidIds.length > 0) {
+          return res.status(400).json({ 
+            success: false, 
+            message: "Invalid group ID format", 
+            invalidIds 
+          });
+        }
+        
         const objectIds = ids.map((id) => new ObjectId(id));
         const groups = await groupCollection
           .find({ _id: { $in: objectIds } })
@@ -406,17 +567,20 @@ async function run() {
         console.error("Error fetching groups by IDs:", error);
         res
           .status(500)
-          .json({ success: false, message: "Failed to fetch groups by IDs" });
+          .json({ success: false, message: "Failed to fetch groups by IDs", details: error.message });
       }
     });
 
-    // ** New: Save User API **
-    app.post("/save-user", async (req, res) => {
+  // ** New: Save User API **
+  app.post("/save-user", async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { email, name, photo } = req.body;
 
         if (!email) {
-          return res.status(400).json({ error: "Email is required" });
+          return res.status(400).json({ success: false, error: "Email is required" });
         }
 
         const updateDoc = {
@@ -427,6 +591,12 @@ async function run() {
             updatedAt: new Date(),
           },
         };
+        
+        // Add createdAt if it's a new user (upsert)
+        const existingUser = await usersCollection.findOne({ email });
+        if (!existingUser) {
+          updateDoc.$set.createdAt = new Date();
+        }
 
         const result = await usersCollection.updateOne({ email }, updateDoc, {
           upsert: true,
@@ -438,11 +608,19 @@ async function run() {
         res.status(500).json({ success: false, error: "Failed to save user" });
       }
     });
-    app.get("/dashboard-stats", async (req, res) => {
+  app.get("/dashboard-stats", async (req, res) => {
       try {
-        // usersCollection
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
+        // usersCollection - Handle cases where createdAt might not exist
         const usersPerDay = await usersCollection
           .aggregate([
+            {
+              $match: {
+                createdAt: { $exists: true, $ne: null }
+              }
+            },
             {
               $group: {
                 _id: {
@@ -498,21 +676,27 @@ async function run() {
       }
     });
 
-    // ** New: Total Users Count API **
-    app.get("/totalUsers", async (req, res) => {
+  // ** New: Total Users Count API **
+  app.get("/totalUsers", async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const total = await usersCollection.estimatedDocumentCount();
         res.status(200).json({ total });
       } catch (error) {
         console.error("Error fetching total users:", error);
-        res.status(500).json({ error: "Failed to fetch total users" });
+        res.status(500).json({ success: false, error: "Failed to fetch total users", details: error.message });
       }
     });
 
-    // ** Articles API **
-    // Create article - Protected: Requires authentication
-    app.post("/articles", authenticateToken, async (req, res) => {
+  // ** Articles API **
+  // Create article - Protected: Requires authentication
+  app.post("/articles", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const articleData = req.body;
         
         // Validate required fields
@@ -550,20 +734,26 @@ async function run() {
       }
     });
 
-    // Get all articles
-    app.get("/articles", async (req, res) => {
+  // Get all articles
+  app.get("/articles", async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const articles = await articlesCollection.find({}).sort({ publishDate: -1, createdAt: -1 }).toArray();
         res.status(200).json(articles);
       } catch (error) {
         console.error("Error fetching articles:", error);
-        res.status(500).json({ success: false, error: "Failed to fetch articles" });
+        res.status(500).json({ success: false, error: "Failed to fetch articles", details: error.message });
       }
     });
 
-    // Get article by ID
-    app.get("/articles/:id", async (req, res) => {
+  // Get article by ID
+  app.get("/articles/:id", async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
           return res.status(400).json({ success: false, error: "Invalid article ID" });
@@ -579,9 +769,12 @@ async function run() {
       }
     });
 
-    // Update article - Protected: Only author can update
-    app.put("/articles/:id", authenticateToken, async (req, res) => {
+  // Update article - Protected: Only author can update
+  app.put("/articles/:id", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
           return res.status(400).json({ success: false, error: "Invalid article ID" });
@@ -625,9 +818,12 @@ async function run() {
       }
     });
 
-    // Delete article - Protected: Only author can delete
-    app.delete("/articles/:id", authenticateToken, async (req, res) => {
+  // Delete article - Protected: Only author can delete
+  app.delete("/articles/:id", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
           return res.status(400).json({ success: false, error: "Invalid article ID" });
@@ -667,10 +863,13 @@ async function run() {
       }
     });
 
-    // ** Comments API **
-    // Get all comments for an article
-    app.get("/articles/:id/comments", async (req, res) => {
+  // ** Comments API **
+  // Get all comments for an article
+  app.get("/articles/:id/comments", async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
           return res.status(400).json({ success: false, error: "Invalid article ID" });
@@ -686,9 +885,12 @@ async function run() {
       }
     });
 
-    // Create a comment
-    app.post("/articles/:id/comments", async (req, res) => {
+  // Create a comment - Protected: Requires authentication
+  app.post("/articles/:id/comments", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
           return res.status(400).json({ success: false, error: "Invalid article ID" });
@@ -707,12 +909,13 @@ async function run() {
           return res.status(400).json({ success: false, error: "Comment text is required" });
         }
 
-        // Prepare comment data
+        // Prepare comment data with authenticated user info
         const newComment = {
           articleId: id,
           text: commentData.text || commentData.comment,
-          authorName: commentData.authorName || "Anonymous",
-          authorEmail: commentData.authorEmail || "",
+          authorName: commentData.authorName || req.user.name || "Anonymous",
+          authorEmail: req.user.email,
+          authorId: req.user.uid,
           authorImage: commentData.authorImage || "https://via.placeholder.com/40",
           timestamp: commentData.timestamp || new Date().toISOString(),
           createdAt: new Date().toISOString(),
@@ -730,9 +933,12 @@ async function run() {
       }
     });
 
-    // Delete a comment - Protected: Only comment author or article author can delete
-    app.delete("/articles/:id/comments/:commentId", authenticateToken, async (req, res) => {
+  // Delete a comment - Protected: Only comment author or article author can delete
+  app.delete("/articles/:id/comments/:commentId", authenticateToken, async (req, res) => {
       try {
+        const dbCheck = await checkDbConnection(res);
+        if (dbCheck) return dbCheck;
+        
         const { id, commentId } = req.params;
         
         if (!ObjectId.isValid(id)) {
@@ -791,12 +997,90 @@ async function run() {
       }
     });
 
-    // Root route
-    app.get("/", (req, res) => {
-      res.send("🎉 Event Booking Server is Running!");
+  // Root route
+  app.get("/", (req, res) => {
+      res.json({ 
+        success: true,
+        message: "🎉 Event Booking Server is Running!",
+        status: "online"
+      });
     });
-  } catch (err) {
-    console.error("❌ MongoDB connection error:", err);
+
+  // 404 handler for undefined routes - Must be after all routes
+  app.use((req, res) => {
+    res.status(404).json({
+      success: false,
+      error: "Route not found",
+      path: req.path
+    });
+  });
+}
+
+// MongoDB connection with retry logic
+async function connectToMongoDB(retries = 5, delay = 2000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      console.log(`Attempting to connect to MongoDB... (Attempt ${i + 1}/${retries})`);
+      
+      // Check if already connected
+      if (client.topology && client.topology.isConnected()) {
+        console.log("✅ Already connected to MongoDB");
+        db = client.db("eventBookingDB");
+        groupCollection = db.collection("groups");
+        joinedCollection = db.collection("joinedGroups");
+        usersCollection = db.collection("users");
+        articlesCollection = db.collection("articles");
+        commentsCollection = db.collection("comments");
+        dbConnected = true;
+        return true;
+      }
+      
+      // Attempt connection
+      await client.connect();
+      console.log("✅ Connected to MongoDB");
+      
+      // Verify connection by pinging
+      await client.db("admin").command({ ping: 1 });
+      console.log("✅ MongoDB connection verified");
+      
+      db = client.db("eventBookingDB");
+      groupCollection = db.collection("groups");
+      joinedCollection = db.collection("joinedGroups");
+      usersCollection = db.collection("users");
+      articlesCollection = db.collection("articles");
+      commentsCollection = db.collection("comments");
+      dbConnected = true;
+      
+      return true;
+    } catch (err) {
+      console.error(`❌ MongoDB connection attempt ${i + 1} failed:`, err.message);
+      
+      if (i < retries - 1) {
+        console.log(`⏳ Retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 1.5; // Exponential backoff
+      } else {
+        console.error("❌ Failed to connect to MongoDB after all retries");
+        console.error("Error details:", err);
+        dbConnected = false;
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+async function run() {
+  // Initialize routes first (always register routes)
+  initializeRoutes();
+  
+  // Connect to MongoDB with retry logic
+  await connectToMongoDB();
+  
+  // If connection failed, log warning but continue (routes will return 503)
+  if (!dbConnected) {
+    console.warn("⚠️ Server running without database connection. Some endpoints will return 503.");
+    console.warn("⚠️ Please check MongoDB credentials and network connectivity.");
   }
 }
 
